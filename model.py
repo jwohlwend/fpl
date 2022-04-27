@@ -1,6 +1,8 @@
 from re import T
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import pytorch_lightning as pl
 
 
@@ -71,6 +73,7 @@ class ValueNetwork(nn.Module):
 
 
 class Model(pl.LightningModule):
+
     def __init__(self, temporal: bool = False, baseline: bool = False):
         self.temporal = temporal
         self.baseline = baseline
@@ -129,12 +132,12 @@ class Model(pl.LightningModule):
         if values != None:  # use the value function as the baseline
             returns = (
                 returns
-                - torch.tensor([gamma ** i for i in range(len(values))])
+                - torch.tensor([self.gamma ** i for i in range(len(values))])
                 * values.detach()
             )  # this is the "advantage"
 
         #### Your code here: compute policy loss based on different objectives
-        if temporal:
+        if self.temporal:
             policy_loss = -(log_probs * returns).sum()
         else:
             policy_loss = -log_probs.sum() * returns[0]
@@ -143,6 +146,8 @@ class Model(pl.LightningModule):
             loss = policy_loss + value_loss
         else:
             loss = policy_loss
+
+        return loss
 
 
 def train():
