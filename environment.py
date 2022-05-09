@@ -10,9 +10,10 @@ from ortools.linear_solver import pywraplp
 
 DIR = os.path.join(os.path.dirname(__file__), "data")
 # SEASONS = ["2016-17", "2017-18", "2018-19", "2019-20"]
-SEASONS = ["2017-18"]
+SEASONS = ["2020-21"]
 TEST_SEASON = "2020-21"
 POS_DICT = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+MAX_TRANSFERS = 3
 
 
 class Action(NamedTuple):
@@ -67,9 +68,12 @@ def lp_team_solver(
     # Sum of player costs should be less than budget
     # contribution of players on team: - sum((1-x)*revenue)
     # contribution of players not on team: sum( x * cost)
-    cost = [(1 - X[p]) * -revenues[p] for p in players if p in on_team]
-    cost += [X[p] * costs[p] for p in players if p not in on_team]
+    cost = [(1 - X[p]) * -revenues[p] for p in players if on_team[p]]
+    cost += [X[p] * costs[p] for p in players if not on_team[p]]
     solver.Add(sum(cost) <= budget)
+
+    # Max number of transfers
+    # solver.Add(sum(X[p] for p in players if not on_team[p]) <= MAX_TRANSFERS)
 
     # Number of keepers = 2
     keepers = [p for p in players if positions[p] == "GK"]
@@ -197,6 +201,9 @@ class FPLEnvironment(object):
             gw: db[db["GW"] == gw].set_index("name", drop=False).to_dict()
             for gw in range(1, self.num_gws + 1)
         }
+        self.id_to_name = (
+            db[["name", "name_str"]].set_index("name", drop=False).to_dict()["name_str"]
+        )
 
     def features(self, device) -> torch.Tensor:
         """
@@ -210,7 +217,7 @@ class FPLEnvironment(object):
             - value in the bank
             - number of free transfers
         """
-        on_team = {p: p in self.state.players for p in self.players}
+        on_team = {p: (p in self.state.players) for p in self.players}
         # TODO: check if iterate on GW is okay here
         db_as_dict = self.db[self.state.gw]
         values = db_as_dict["value"]
@@ -284,12 +291,12 @@ class FPLEnvironment(object):
                 else:
                     revenues[player] = new_value
             # TODO: ideally remove this
-            elif player not in values:
-                costs[player] = 1000
-                revenues[player] = 0.0
-                positions[player] = "DEF"
-                teams[player] = 1
-                points[player] = 0
+            # elif player not in values:
+            #     costs[player] = 1000
+            #     revenues[player] = 0.0
+            #     positions[player] = "DEF"
+            #     teams[player] = 1
+            #     points[player] = 0
             else:
                 costs[player] = values[player]
                 revenues[player] = 0.0
