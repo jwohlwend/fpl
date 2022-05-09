@@ -5,17 +5,21 @@ from tqdm import tqdm
 from environment import FPLEnvironment
 import os
 import time
+import numpy as np
 
 SAVE_DIR = "checkpoints"
 TEMPORAL = True
 USE_VALUE_NETWORK = False
 MAX_EPISODES = 1000
-LOG_INTERVAL = 1000
+LOG_INTERVAL = 1
 STEP_SAVE = 100
 LR = 1e-4
 GAMMA = 0.999
-MAX_T = 38
-DEVICE = torch.device("cpu")
+MAX_T = 5
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
 
 
 class PolicyNetwork(nn.Module):
@@ -46,6 +50,7 @@ class PolicyNetwork(nn.Module):
             nn.Dropout(dropout),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
+            nn.Sigmoid(),  # TODO: check this
         )
 
     def forward(self, data):
@@ -97,15 +102,26 @@ def save_checkpoint(net, optimizer, save_dir="checkpoints"):
     print("Saved checkpoint %s" % save_path)
 
 
-def rollout(env, model, vmodel=None, device=DEVICE, MAX_T=38):
+def add_noise(priority):
+    priority_noise = {}
+    for k, v in priority.items():
+        if np.random.rand() < 0.05:
+            new_v = np.random.uniform(0, 1)
+        else:
+            new_v = v
+        priority_noise[k] = new_v
+    return priority_noise
+
+
+def rollout(env, model, vmodel=None, device=DEVICE):
+    env.reset()
     rewards = torch.zeros(MAX_T, device=device)
     priorities = torch.zeros(MAX_T, len(env.players), device=device)
+    masks = torch.zeros(MAX_T, len(env.players), device=device)
     values = torch.zeros(MAX_T, device=device)
-    env.reset()
 
-    T = 0
     ep_reward = 0
-    while T < MAX_T:
+    for T in tqdm(range(MAX_T), total=MAX_T):
         obs = env.features(device)
         x = obs.unsqueeze(dim=0)
         priority = model(x)[0]
@@ -114,15 +130,19 @@ def rollout(env, model, vmodel=None, device=DEVICE, MAX_T=38):
             values[T] = value
 
         priority_dict = {p: priority[i].cpu().item() for i, p in enumerate(env.players)}
+        if np.random.rand() < 0.1:
+            priority_dict = add_noise(priority_dict)
+
         action = env.sample_action(priority_dict)
-        reward = env.update(action)
+        reward, mask = env.update(action)
 
         ep_reward += reward
         rewards[T] = reward
         priorities[T] = priority
-        T += 1
+        masks[T] = mask
 
-    return priorities[:T], rewards[:T], values[:T], ep_reward
+    # return priorities[:T], rewards[:T], values[:T], ep_reward, masks[:T]
+    return priorities, rewards, values, ep_reward, masks
 
 
 def discounted_returns(rewards, gamma):
@@ -134,7 +154,7 @@ def discounted_returns(rewards, gamma):
     return returns
 
 
-def update_parameters(optimizer, priorities, rewards, values):
+def update_parameters(optimizer, priorities, rewards, values, mask):
 
     # compute policy losses
     policy_loss = []
@@ -148,14 +168,15 @@ def update_parameters(optimizer, priorities, rewards, values):
     if values is not None:
         returns = (
             returns
-            - torch.tensor([GAMMA ** i for i in range(len(values))]) * values.detach()
+            - torch.tensor([GAMMA ** i for i in range(len(values))]).to(returns)
+            * values.detach()
         )  # this is the "advantage"
 
     # compute policy loss based on different objectives
     if TEMPORAL:
-        policy_loss = -(priorities * returns).sum()
+        policy_loss = -((priorities * mask).mean(dim=1) * returns).sum()
     else:
-        policy_loss = -priorities.sum() * returns[0]
+        policy_loss = -(priorities * mask).mean(dim=1).sum() * returns[0]
 
     if values is not None:
         loss = policy_loss + value_loss
@@ -166,6 +187,7 @@ def update_parameters(optimizer, priorities, rewards, values):
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
+    print("Loss: ", loss)
 
 
 def train():
@@ -185,10 +207,10 @@ def train():
     history_reward = []  # store moving average of empirical rewards
 
     for step in tqdm(range(MAX_EPISODES)):
-        priorities, rewards, values, ep_reward = rollout(
-            env, model, vmodel=vmodel, device=DEVICE, MAX_T=MAX_T
+        priorities, rewards, values, ep_reward, mask = rollout(
+            env, model, vmodel=vmodel, device=DEVICE
         )
-        update_parameters(optimizer, priorities, rewards, values)
+        update_parameters(optimizer, priorities, rewards, values, mask)
         running_reward = 0.05 * ep_reward + (1 - 0.05) * running_reward
         history_reward.append(running_reward)
 
@@ -200,10 +222,11 @@ def train():
             )
 
         if step % STEP_SAVE == 0:
+            pass
             # Saves model checkpoint
-            save_checkpoint(model, optimizer, SAVE_DIR)
+            # save_checkpoint(model, optimizer, SAVE_DIR)
 
-    save_checkpoint(model, optimizer, SAVE_DIR)
+    # save_checkpoint(model, optimizer, SAVE_DIR)
     return history_reward
 
 

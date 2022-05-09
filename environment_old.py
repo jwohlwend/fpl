@@ -190,13 +190,8 @@ class FPLEnvironment(object):
     def load_db(self, season):
         # Load season data
         path = os.path.join(DIR, f"fpl_season_{season}v1.csv")
-        db = pd.read_csv(path, encoding="ISO-8859-1")
-        self.num_gws = len(set(db["GW"]))
-        self.players = list(db["name"].unique())
-        self.db = {
-            gw: db[db["GW"] == gw].set_index("name", drop=False).to_dict()
-            for gw in range(1, self.num_gws + 1)
-        }
+        self.db = pd.read_csv(path, encoding="ISO-8859-1")
+        self.players = list(self.db["name"].unique())        
 
     def features(self, device) -> torch.Tensor:
         """
@@ -212,7 +207,9 @@ class FPLEnvironment(object):
         """
         on_team = {p: p in self.state.players for p in self.players}
         # TODO: check if iterate on GW is okay here
-        db_as_dict = self.db[self.state.gw]
+        db_as_dict = (
+            self.db[self.db["GW"] == (self.state.gw)].set_index("name").to_dict()
+        )
         values = db_as_dict["value"]
 
         costs = {}
@@ -244,10 +241,11 @@ class FPLEnvironment(object):
                 self.state.bank,
             ]
             # player_points = list(self.db[self.db["name"] == player]["total_points"])
-            player_points = [
-                self.db[i]["total_points"][player]
-                for i in range(self.state.gw, self.num_gws + 1)
-            ]
+            player_points = list(
+                self.db[(self.db["name"] == player) & (self.db["GW"] >= self.state.gw)][
+                    "total_points"
+                ]
+            )
             features = features + player_points
             if len(features) > 43:
                 import pdb
@@ -265,11 +263,13 @@ class FPLEnvironment(object):
         """Sample a valid action given the model priority prediction."""
         on_team = {p: p in self.state.players for p in self.players}
 
-        db_as_dict = self.db[self.state.gw]
-        positions = db_as_dict["position"]
-        teams = db_as_dict["team"]
-        values = db_as_dict["value"]
-        points = db_as_dict["total_points"]
+        self.db_as_dict = (
+            self.db[self.db["GW"] == self.state.gw].set_index("name").to_dict()
+        )
+        positions = self.db_as_dict["position"]
+        teams = self.db_as_dict["team"]
+        values = self.db_as_dict["value"]
+        points = self.db_as_dict["total_points"]
 
         costs = {}
         revenues = {}
@@ -338,7 +338,9 @@ class FPLEnvironment(object):
         bought = deepcopy(current.player_bought_value)
         for player in action.players_out:
             # Use value of the next starting gw
-            new_value = self.db[current.gw]["value"][player]
+            new_value = self.db[
+                (self.db["name"] == player) & (self.db["GW"] == current.gw)
+            ].iloc[0]["value"]
 
             # Update player list
             players.remove(player)
@@ -352,7 +354,10 @@ class FPLEnvironment(object):
 
         for player in action.players_in:
             # Get new value
-            new_value = self.db[current.gw]["value"][player]
+            new_value = self.db[
+                (self.db["name"] == player) & (self.db["GW"] == current.gw)
+            ].iloc[0]["value"]
+
             players.add(player)
             bought[player] = new_value
             net -= new_value
@@ -368,8 +373,8 @@ class FPLEnvironment(object):
             points = max(num - free, 0) * -4
 
         # Non bench first, and potentially sub in players
-        positions = self.db[current.gw]["position"]
-        minutes_dict = self.db[current.gw]["minutes"]
+        positions = self.db_as_dict["position"]
+        minutes_dict = self.db_as_dict["minutes"]
 
         # Compute whether captain played any minutes
         captain_minutes = minutes_dict[action.captain]
@@ -395,7 +400,10 @@ class FPLEnvironment(object):
             if positions[player] == "GK":
                 keeper_played = True
 
-            points_given = self.db[current.gw]["total_points"][player]
+            points_given = self.db[
+                (self.db["name"] == player) & (self.db["GW"] == current.gw)
+            ].iloc[0]["total_points"]
+
             if action.captain == player and captain_played:
                 points_given *= 2
             elif action.vice_captain == player and not captain_played:
@@ -406,7 +414,9 @@ class FPLEnvironment(object):
 
         # Sub-in keeper if needed
         if not keeper_played:
-            points_given = self.db[current.gw]["total_points"][action.bench_0]
+            points_given = self.db[
+                (self.db["name"] == action.bench_0) & (self.db["GW"] == current.gw)
+            ].iloc[0]["total_points"]
             points += points_given
             players_used.add(action.bench_0)
 
@@ -429,7 +439,9 @@ class FPLEnvironment(object):
             if removed is not None:
                 fielded_not_played.remove(removed)
                 fielded_per_positon[can_pos] -= 1
-                points_given = self.db[current.gw]["total_points"][candidate]
+                points_given = self.db[
+                    (self.db["name"] == candidate) & (self.db["GW"] == current.gw)
+                ].iloc[0]["total_points"]
                 points += points_given
                 players_used.add(candidate)
 
