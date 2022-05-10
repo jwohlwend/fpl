@@ -14,11 +14,13 @@ SEASONS = ["2020-21"]
 TEST_SEASON = "2020-21"
 POS_DICT = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 MAX_TRANSFERS = 3
+LOOKAHEAD = 2
 
 
 class Action(NamedTuple):
     players_out: Set[str]
     players_in: Set[str]
+    players_all: Set[str]
     captain: str
     vice_captain: str
     bench_0: str
@@ -44,6 +46,7 @@ def lp_team_solver(
     positions: Dict[str, str],
     teams: Dict[str, str],
     budget: float,
+    impose_max_transfer: bool = False,
 ):
     """Solves the FPL linear program team selection:
 
@@ -73,7 +76,8 @@ def lp_team_solver(
     solver.Add(sum(cost) <= budget)
 
     # Max number of transfers
-    # solver.Add(sum(X[p] for p in players if not on_team[p]) <= MAX_TRANSFERS)
+    if impose_max_transfer:
+        solver.Add(sum(X[p] for p in players if not on_team[p]) <= MAX_TRANSFERS)
 
     # Number of keepers = 2
     keepers = [p for p in players if positions[p] == "GK"]
@@ -110,10 +114,11 @@ def lp_team_solver(
         players_out = {
             p for p in players if (on_team[p]) and (round(X[p].solution_value()) == 0)
         }
+        players_all = {p for p in players if (round(X[p].solution_value()) == 1)}
     else:
         raise ValueError("The problem does not have an optimal solution.")
 
-    return players_in, players_out
+    return players_in, players_out, players_all
 
 
 def lp_formation_solver(points, positions):
@@ -164,7 +169,7 @@ class FPLEnvironment(object):
     state: State
 
     def __init__(self):
-        self.feature_dim = 43
+        self.feature_dim = LOOKAHEAD
         self.reset()
 
     def reset(self, test: bool = False):
@@ -177,18 +182,48 @@ class FPLEnvironment(object):
             season = SEASONS[idx]
 
         # Load data and team
-        self.init_state()
         self.load_db(season)
+        self.init_state()
 
     def init_state(self):
+        player_points = {
+            k: sum(gw_dict["total_points"][k] for gw, gw_dict in self.db.items())
+            for k in self.players
+        }
+        player_costs = self.db[1]["value"]
+
+        # random team
+        random = np.random.RandomState(42)
+        player_points = {k: random.randint(0, 30) for k in self.players}
+
+        players_in, _, _ = lp_team_solver(
+            points=player_points,
+            costs=player_costs,
+            revenues={p: 0 for p in self.players},
+            on_team={p: False for p in self.players},
+            positions=self.db[1]["position"],
+            teams=self.db[1]["team"],
+            budget=1000,
+            impose_max_transfer=False,
+        )
+
         init_state = State(
-            players=set(),
-            bank=1000,
+            players=players_in,
+            bank=1000 - sum(player_costs[p] for p in players_in),
             gw=1,
-            free_transfers=15,  # wildcard
-            player_bought_value=dict(),
+            free_transfers=1,
+            player_bought_value={p: player_costs[p] for p in players_in},
             points=0,
         )
+
+        # init_state = State(
+        #     players=set(),
+        #     bank=1000,
+        #     gw=1,
+        #     free_transfers=15,  # wildcard
+        #     player_bought_value=dict(),
+        #     points=0,
+        # )
         self.state = init_state
 
     def load_db(self, season):
@@ -205,7 +240,7 @@ class FPLEnvironment(object):
             db[["name", "name_str"]].set_index("name", drop=False).to_dict()["name_str"]
         )
 
-    def features(self, device) -> torch.Tensor:
+    def features(self, device):
         """
         Return the feature to pass to the model for prediction.
         `features`: torch.Tensor (N,d) for N players and d features
@@ -250,21 +285,18 @@ class FPLEnvironment(object):
                 self.state.free_transfers,
                 self.state.bank,
             ]
-            # player_points = list(self.db[self.db["name"] == player]["total_points"])
             player_points = [
                 self.db[i]["total_points"][player]
-                for i in range(self.state.gw, self.num_gws + 1)
+                for i in range(self.state.gw, min(self.state.gw + LOOKAHEAD, self.num_gws + 1))
             ]
-            features = features + player_points
-            if len(features) > 43:
-                import pdb
-
-                pdb.set_trace()
+            # features = features + player_points
+            features = player_points
             # Pad if needed
-            features += [0] * (43 - len(features))
+            # features += [0] * (43 - len(features))
+            features += [0] * (LOOKAHEAD - len(features))
             total_features.append(features)
 
-        total_features = torch.tensor(total_features, dtype=torch.float, device=device)
+        total_features = torch.tensor(total_features, dtype=torch.float, device=device)  # type: ignore
         # total_features[:self.state.gw] = 0
         return total_features
 
@@ -290,19 +322,12 @@ class FPLEnvironment(object):
                     revenues[player] = old_value + (new_value - old_value) // 2
                 else:
                     revenues[player] = new_value
-            # TODO: ideally remove this
-            # elif player not in values:
-            #     costs[player] = 1000
-            #     revenues[player] = 0.0
-            #     positions[player] = "DEF"
-            #     teams[player] = 1
-            #     points[player] = 0
             else:
                 costs[player] = values[player]
                 revenues[player] = 0.0
 
         # Solve with LP
-        players_in, players_out = lp_team_solver(
+        players_in, players_out, players_all = lp_team_solver(
             points=priority,
             costs=costs,
             revenues=revenues,
@@ -310,6 +335,7 @@ class FPLEnvironment(object):
             positions=positions,
             teams=teams,
             budget=self.state.bank,
+            impose_max_transfer=True,  # self.state.gw > 1,
         )
 
         # Choose formation
@@ -326,6 +352,7 @@ class FPLEnvironment(object):
         action = Action(
             players_out=players_out,
             players_in=players_in,
+            players_all=players_all,
             captain=captain,
             vice_captain=vice_captain,
             bench_0=benched[0],
@@ -452,6 +479,7 @@ class FPLEnvironment(object):
             player_bought_value=bought,
             points=new_points,
         )
+        print("\n", new_bank + sum(self.db[current.gw]["value"][p] for p in players))
         self.state = new_state
         mask = [1 if p in players_used else 0 for p in self.players]
         mask = torch.tensor(mask)  # type: ignore

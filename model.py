@@ -15,7 +15,11 @@ LOG_INTERVAL = 1
 STEP_SAVE = 100
 LR = 1e-4
 GAMMA = 0.999
-MAX_T = 5
+MAX_T = 38
+NOISE = 0
+PROB_OF_ADD_NOISE = 0.05
+
+
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
 else:
@@ -50,6 +54,7 @@ class PolicyNetwork(nn.Module):
             nn.Dropout(dropout),
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
+            # nn.ReLU(),
             nn.Sigmoid(),  # TODO: check this
         )
 
@@ -60,6 +65,7 @@ class PolicyNetwork(nn.Module):
         encodings = self.transformer(embedding)
         # output is of shape 1 x N
         output = self.fc(encodings).squeeze(-1)
+        # output = torch.softmax(output, dim=1)
         return output
 
 
@@ -105,7 +111,7 @@ def save_checkpoint(net, optimizer, save_dir="checkpoints"):
 def add_noise(priority):
     priority_noise = {}
     for k, v in priority.items():
-        if np.random.rand() < 0.05:
+        if np.random.rand() < PROB_OF_ADD_NOISE:
             new_v = np.random.uniform(0, 1)
         else:
             new_v = v
@@ -121,7 +127,7 @@ def rollout(env, model, vmodel=None, device=DEVICE):
     values = torch.zeros(MAX_T, device=device)
 
     ep_reward = 0
-    for T in tqdm(range(MAX_T), total=MAX_T):
+    for T in range(MAX_T):
         obs = env.features(device)
         x = obs.unsqueeze(dim=0)
         priority = model(x)[0]
@@ -130,10 +136,12 @@ def rollout(env, model, vmodel=None, device=DEVICE):
             values[T] = value
 
         priority_dict = {p: priority[i].cpu().item() for i, p in enumerate(env.players)}
-        if np.random.rand() < 0.1:
+        if np.random.rand() < NOISE:
             priority_dict = add_noise(priority_dict)
 
         action = env.sample_action(priority_dict)
+        print([env.id_to_name[p] for p in action.players_out])
+        print([env.id_to_name[p] for p in action.players_in])
         reward, mask = env.update(action)
 
         ep_reward += reward
@@ -161,11 +169,11 @@ def update_parameters(optimizer, priorities, rewards, values, mask):
     returns = discounted_returns(rewards, GAMMA)
 
     # compute value loss by fitting values to observed returns
-    if values is not None:
+    if USE_VALUE_NETWORK:
         value_loss = F.smooth_l1_loss(values, returns)
 
     # use the value function as the baseline
-    if values is not None:
+    if USE_VALUE_NETWORK:
         returns = (
             returns
             - torch.tensor([GAMMA ** i for i in range(len(values))]).to(returns)
@@ -178,7 +186,7 @@ def update_parameters(optimizer, priorities, rewards, values, mask):
     else:
         policy_loss = -(priorities * mask).mean(dim=1).sum() * returns[0]
 
-    if values is not None:
+    if USE_VALUE_NETWORK:
         loss = policy_loss + value_loss
     else:
         loss = policy_loss
